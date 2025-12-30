@@ -1,0 +1,145 @@
+#include <LovyanGFX.hpp>
+#include <IRremoteESP8266.h>
+#include <IRrecv.h>
+#include <IRsend.h>
+#include <IRutils.h>
+#include <WiFi.h>
+#include "esp_wifi.h"
+#include <vector>
+
+// --- 固定設定 ---
+const uint16_t kSendPin = 25; 
+const uint16_t kRecvPin = 32;
+const int V27_ID = 27;
+const int SCAN_TIME = 27000; 
+
+IRrecv irrecv(kRecvPin);
+IRsend irsend(kSendPin);
+decode_results results;
+
+struct IRData {
+  String name; uint64_t code; uint16_t bits; decode_type_t type;
+};
+struct SignalData {
+  String ssid; String mac; int rssi;
+};
+
+std::vector<IRData> irList;
+std::vector<SignalData> sigList;
+int currentTab = 0; 
+int scrollY = 0; 
+int lastTouchY = -1;
+String broMessage = "V27 SIGINT READY!";
+
+// --- LovyanGFX 設定 ---
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ST7796 _p; lgfx::Bus_SPI _b; lgfx::Light_PWM _l; lgfx::Touch_XPT2046 _t;
+public:
+  LGFX() {
+    { auto c = _b.config(); c.spi_host = HSPI_HOST; c.pin_sclk = 14;
+      c.pin_mosi = 13; c.pin_miso = 12; c.pin_dc = 2; _b.config(c); _p.setBus(&_b); }
+    { auto c = _p.config();
+      c.pin_cs = 15; c.pin_rst = 4; c.panel_width = 320; c.panel_height = 480; _p.config(c); }
+    { auto c = _l.config(); c.pin_bl = 27; c.freq = 44100; c.pwm_channel = 7; _l.config(c); _p.setLight(&_l); } 
+    { auto c = _t.config(); c.pin_cs = 33; c.spi_host = HSPI_HOST; c.bus_shared = true;
+      c.x_min = 0; c.x_max = 319; c.y_min = 0; c.y_max = 479; _t.config(c); _p.setTouch(&_t); }
+    setPanel(&_p);
+  }
+};
+LGFX lcd;
+
+// --- キャラクター描画 ---
+void drawBlobman(int x, int y, String eye = "^ ^", String mouth = " ◡ ") {
+  lcd.fillRect(x-40, y-80, 80, 15, TFT_WHITE);
+  lcd.fillRect(x-40, y-65, 15, 65, TFT_WHITE);
+  lcd.fillRect(x+25, y-65, 15, 65, TFT_WHITE);
+  lcd.fillRect(x-40, y, 80, 15, TFT_WHITE);
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.setTextSize(2);
+  lcd.drawString(eye, x-15, y-45);
+  lcd.drawString(mouth, x-15, y-20);
+}
+
+// --- UI描画 ---
+void drawUI() {
+  lcd.startWrite();
+  lcd.fillScreen(TFT_BLACK);
+  lcd.drawFastHLine(0, 40, 320, TFT_WHITE);
+  
+  if (currentTab == 0) {
+    lcd.drawCenterString("[ SYSTEM: V27 SIGINT ]", 160, 10);
+    drawBlobman(160, 240);
+    lcd.drawRect(10, 320, 140, 60, TFT_WHITE); lcd.drawCenterString("RADAR", 80, 340);
+    lcd.drawRect(170, 320, 140, 60, TFT_WHITE); lcd.drawCenterString("COLLECT", 240, 340);
+    lcd.drawRect(210, 60, 100, 60, TFT_RED); lcd.drawCenterString("IR LIST", 260, 80);
+  } else if (currentTab == 1) {
+    lcd.drawCenterString("[ IR SIGNAL LIST ]", 160, 10);
+    for (int i = 0; i < (int)irList.size(); i++) {
+      int itemY = 80 + (i * 65) + scrollY;
+      if (itemY > 30 && itemY < 410) { 
+        lcd.drawRect(10, itemY, 180, 50, TFT_WHITE);
+        lcd.setCursor(20, itemY + 15); lcd.print(irList[i].name);
+        lcd.drawRect(200, itemY, 105, 50, TFT_RED); lcd.drawCenterString("SEND", 252, itemY + 15);
+      }
+    }
+    lcd.fillRect(0, 410, 320, 70, TFT_BLACK);
+    lcd.drawFastHLine(0, 410, 320, TFT_WHITE);
+    lcd.drawRect(210, 420, 100, 50, TFT_WHITE); lcd.drawCenterString("BACK", 260, 435);
+  } else if (currentTab == 3) {
+    lcd.drawCenterString("[ CAPTURED WIFI ]", 160, 10);
+    for (int i = 0; i < (int)sigList.size(); i++) {
+      int itemY = 80 + (i * 65) + scrollY;
+      if (itemY > 30 && itemY < 410) {
+        lcd.drawRect(10, itemY, 300, 50, TFT_GREEN);
+        lcd.setCursor(20, itemY + 15); lcd.printf("%s (%d)", sigList[i].ssid.substring(0,15).c_str(), sigList[i].rssi);
+      }
+    }
+    lcd.fillRect(0, 410, 320, 70, TFT_BLACK);
+    lcd.drawFastHLine(0, 410, 320, TFT_WHITE);
+    lcd.drawRect(210, 420, 100, 50, TFT_WHITE); lcd.drawCenterString("BACK", 260, 435);
+  }
+  
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.drawString("bro: " + broMessage, 10, 455);
+  lcd.endWrite();
+}
+
+// --- 27秒スキャン ---
+void runRadar() {
+  broMessage = "SCANNING WIFI..."; drawUI();
+  unsigned long start = millis();
+  sigList.clear();
+  while(millis() - start < SCAN_TIME) {
+    int n = WiFi.scanNetworks();
+    for (int i = 0; i < n && sigList.size() < 27; i++) {
+      sigList.push_back({WiFi.SSID(i), WiFi.BSSIDstr(i), WiFi.RSSI(i)});
+    }
+    delay(500);
+  }
+  broMessage = "SCAN COMPLETE!"; currentTab = 3; drawUI();
+}
+
+void setup() {
+  irrecv.enableIRIn();
+  irsend.begin();
+  lcd.init();
+  lcd.setRotation(0);
+  lcd.setBrightness(255);
+  uint16_t calibrateData[8] = { 250, 3600, 250, 250, 3600, 3600, 3600, 250 };
+  lcd.setTouchCalibrate(calibrateData);
+  drawUI();
+}
+
+void loop() {
+  uint16_t tx, ty;
+  if (lcd.getTouch(&tx, &ty)) {
+    if (currentTab == 0) {
+      if (tx > 10 && tx < 150 && ty > 320) { runRadar(); }
+      if (tx > 170 && tx < 310 && ty > 320) { currentTab = 3; scrollY = 0; drawUI(); }
+      if (tx > 210 && ty > 60 && ty < 120) { currentTab = 1; scrollY = 0; drawUI(); }
+    } else {
+      if (tx > 210 && ty > 420) { currentTab = 0; drawUI(); delay(200); }
+    }
+  }
+  delay(10);
+}
